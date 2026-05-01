@@ -924,6 +924,7 @@ class AIAgent:
         tool_progress_callback: callable = None,
         tool_start_callback: callable = None,
         tool_complete_callback: callable = None,
+        token_usage_callback: callable = None,
         thinking_callback: callable = None,
         reasoning_callback: callable = None,
         clarify_callback: callable = None,
@@ -1143,6 +1144,12 @@ class AIAgent:
         self.tool_progress_callback = tool_progress_callback
         self.tool_start_callback = tool_start_callback
         self.tool_complete_callback = tool_complete_callback
+        # Youmake fork: per-API-call cumulative usage callback.  Fired
+        # once after each successful LLM response with the running session
+        # totals.  Used by the api_server gateway to push structured
+        # ``token_usage.delta`` SSE events without re-walking the agent
+        # state from another thread.  Optional and defensively wrapped.
+        self.token_usage_callback = token_usage_callback
         self.suppress_status_output = False
         self.thinking_callback = thinking_callback
         self.reasoning_callback = reasoning_callback
@@ -11652,6 +11659,22 @@ class AIAgent:
                         self.session_cache_read_tokens += canonical_usage.cache_read_tokens
                         self.session_cache_write_tokens += canonical_usage.cache_write_tokens
                         self.session_reasoning_tokens += canonical_usage.reasoning_tokens
+
+                        # Youmake fork: notify the gateway about per-API-call
+                        # cumulative usage so it can push a token_usage.delta
+                        # SSE event mid-stream.  Defensive — must never break
+                        # the agent loop on a callback exception.
+                        if self.token_usage_callback is not None:
+                            try:
+                                self.token_usage_callback({
+                                    "input": self.session_input_tokens,
+                                    "output": self.session_output_tokens,
+                                    "cacheRead": self.session_cache_read_tokens,
+                                    "cacheWrite": self.session_cache_write_tokens,
+                                    "total": self.session_total_tokens,
+                                })
+                            except Exception:
+                                logger.debug("token_usage_callback raised", exc_info=True)
 
                         # Log API call details for debugging/observability
                         _cache_pct = ""

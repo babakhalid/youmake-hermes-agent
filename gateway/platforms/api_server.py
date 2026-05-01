@@ -717,6 +717,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
+        token_usage_callback=None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -757,6 +758,7 @@ class APIServerAdapter(BasePlatformAdapter):
             tool_progress_callback=tool_progress_callback,
             tool_start_callback=tool_start_callback,
             tool_complete_callback=tool_complete_callback,
+            token_usage_callback=token_usage_callback,
             session_db=self._ensure_session_db(),
             fallback_model=fallback_model,
         )
@@ -986,6 +988,9 @@ class APIServerAdapter(BasePlatformAdapter):
             # (e.g. internal/filtered tools) is silently dropped instead of
             # producing an orphaned event clients can't correlate.
             _started_tool_call_ids: set[str] = set()
+            # Youmake fork: per-tool start timestamp so the structured
+            # ``tool_use.completed`` payload can carry ``duration_ms``.
+            _tool_start_times: Dict[str, float] = {}
 
             def _on_tool_start(tool_call_id, function_name, function_args):
                 """Emit ``hermes.tool.progress`` with ``status: running``.
@@ -999,10 +1004,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 Skips tools whose names start with ``_`` so internal
                 events (``_thinking``, …) stay off the wire — matching
                 the prior ``_on_tool_progress`` filter exactly.
+
+                Youmake fork: also pushes a structured
+                ``__tool_use_started__`` event for the orchestrator,
+                in addition to the upstream ``__tool_progress__``.
                 """
                 if not tool_call_id or function_name.startswith("_"):
                     return
                 _started_tool_call_ids.add(tool_call_id)
+                _tool_start_times[tool_call_id] = time.time()
                 from agent.display import build_tool_preview, get_tool_emoji
                 label = build_tool_preview(function_name, function_args) or function_name
                 _stream_q.put(("__tool_progress__", {
@@ -1012,6 +1022,25 @@ class APIServerAdapter(BasePlatformAdapter):
                     "toolCallId": tool_call_id,
                     "status": "running",
                 }))
+                # Structured event for orchestrators that don't want to
+                # parse the legacy hermes.tool.progress shape.  Inputs
+                # are coerced to a JSON-safe dict (the agent sometimes
+                # passes the args as a JSON string).
+                if isinstance(function_args, str):
+                    try:
+                        _input = json.loads(function_args)
+                    except Exception:
+                        _input = {"_raw": function_args}
+                elif isinstance(function_args, dict):
+                    _input = function_args
+                else:
+                    _input = {"_value": str(function_args)}
+                _stream_q.put(("__tool_use_started__", {
+                    "id": tool_call_id,
+                    "tool": function_name,
+                    "input": _input,
+                    "ts": _tool_start_times[tool_call_id],
+                }))
 
             def _on_tool_complete(tool_call_id, function_name, function_args, function_result):
                 """Emit the matching ``status: completed`` event.
@@ -1019,6 +1048,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 Dropped if the start was filtered (internal tool, missing
                 id, or never seen) so clients never get an orphaned
                 ``completed`` they can't correlate to a prior ``running``.
+
+                Youmake fork: also pushes a structured
+                ``__tool_use_completed__`` carrying ``duration_ms`` and a
+                short output preview for orchestrator UIs.
                 """
                 if not tool_call_id or tool_call_id not in _started_tool_call_ids:
                     return
@@ -1028,6 +1061,39 @@ class APIServerAdapter(BasePlatformAdapter):
                     "toolCallId": tool_call_id,
                     "status": "completed",
                 }))
+                _started_at = _tool_start_times.pop(tool_call_id, None)
+                _duration_ms = (
+                    int((time.time() - _started_at) * 1000)
+                    if _started_at is not None else 0
+                )
+                # Bound the preview tightly — token streams are ~100 chars
+                # in the OpenAI-shape SSE chunks, so match that magnitude.
+                _preview = ""
+                if function_result is not None:
+                    try:
+                        _preview = (
+                            function_result if isinstance(function_result, str)
+                            else json.dumps(function_result, default=str)
+                        )[:240]
+                    except Exception:
+                        _preview = ""
+                _stream_q.put(("__tool_use_completed__", {
+                    "id": tool_call_id,
+                    "output_preview": _preview,
+                    "duration_ms": _duration_ms,
+                }))
+
+            def _on_token_usage(usage_payload):
+                """Push a ``token_usage.delta`` SSE event.
+
+                Fired by the agent once per LLM API call with the running
+                session totals.  Defensive — the agent thread invokes it,
+                so any exception here would otherwise crash the loop.
+                """
+                try:
+                    _stream_q.put(("__token_usage_delta__", usage_payload))
+                except Exception:
+                    pass
 
             # Start agent in background.  agent_ref is a mutable container
             # so the SSE writer can interrupt the agent on client disconnect.
@@ -1046,6 +1112,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 stream_delta_callback=_on_delta,
                 tool_start_callback=_on_tool_start,
                 tool_complete_callback=_on_tool_complete,
+                token_usage_callback=_on_token_usage,
                 agent_ref=agent_ref,
             ))
 
@@ -1158,6 +1225,30 @@ class APIServerAdapter(BasePlatformAdapter):
             last_activity = time.monotonic()
 
             # Helper — route a queue item to the correct SSE event.
+            #
+            # Youmake fork: in addition to the upstream ``__tool_progress__``
+            # tuple, the helper recognises five structured event types
+            # used by the Youmake orchestrator to render tool/token/approval
+            # state without parsing assistant text:
+            #
+            #   __tool_use_started__  -> event: tool_use.started
+            #   __tool_use_completed__ -> event: tool_use.completed
+            #   __token_usage_delta__ -> event: token_usage.delta
+            #   __token_usage_final__ -> event: token_usage.final
+            #   __approval_request__  -> event: approval.request
+            #
+            # All five emit using the SSE ``event:`` field, which OpenAI
+            # client parsers ignore (they only consume ``data:`` lines for
+            # ``chat.completion.chunk`` objects), so the additions are
+            # non-breaking for stock OpenAI SDKs.
+            _STRUCTURED_EVENTS = {
+                "__tool_use_started__": "tool_use.started",
+                "__tool_use_completed__": "tool_use.completed",
+                "__token_usage_delta__": "token_usage.delta",
+                "__token_usage_final__": "token_usage.final",
+                "__approval_request__": "approval.request",
+            }
+
             async def _emit(item):
                 """Write a single queue item to the SSE stream.
 
@@ -1168,18 +1259,27 @@ class APIServerAdapter(BasePlatformAdapter):
                 conversation history.  See #6972 for the original event,
                 #16588 for the ``toolCallId``/``status`` lifecycle fields.
                 """
-                if isinstance(item, tuple) and len(item) == 2 and item[0] == "__tool_progress__":
-                    event_data = json.dumps(item[1])
-                    await response.write(
-                        f"event: hermes.tool.progress\ndata: {event_data}\n\n".encode()
-                    )
-                else:
-                    content_chunk = {
-                        "id": completion_id, "object": "chat.completion.chunk",
-                        "created": created, "model": model,
-                        "choices": [{"index": 0, "delta": {"content": item}, "finish_reason": None}],
-                    }
-                    await response.write(f"data: {json.dumps(content_chunk)}\n\n".encode())
+                if isinstance(item, tuple) and len(item) == 2:
+                    tag, payload = item
+                    if tag == "__tool_progress__":
+                        event_data = json.dumps(payload)
+                        await response.write(
+                            f"event: hermes.tool.progress\ndata: {event_data}\n\n".encode()
+                        )
+                        return time.monotonic()
+                    structured = _STRUCTURED_EVENTS.get(tag)
+                    if structured is not None:
+                        event_data = json.dumps(payload)
+                        await response.write(
+                            f"event: {structured}\ndata: {event_data}\n\n".encode()
+                        )
+                        return time.monotonic()
+                content_chunk = {
+                    "id": completion_id, "object": "chat.completion.chunk",
+                    "created": created, "model": model,
+                    "choices": [{"index": 0, "delta": {"content": item}, "finish_reason": None}],
+                }
+                await response.write(f"data: {json.dumps(content_chunk)}\n\n".encode())
                 return time.monotonic()
 
             # Stream content chunks as they arrive from the agent
@@ -1234,6 +1334,20 @@ class APIServerAdapter(BasePlatformAdapter):
                 },
             }
             await response.write(f"data: {json.dumps(finish_chunk)}\n\n".encode())
+            # Youmake fork: emit a structured token_usage.final event
+            # before [DONE] so orchestrators that subscribe to ``event:``
+            # lines (and ignore the OpenAI-shape ``data:`` chunks) get a
+            # single canonical usage record per stream.
+            final_usage_payload = json.dumps({
+                "input": usage.get("input_tokens", 0),
+                "output": usage.get("output_tokens", 0),
+                "cacheRead": usage.get("cache_read_tokens", 0),
+                "cacheWrite": usage.get("cache_write_tokens", 0),
+                "total": usage.get("total_tokens", 0),
+            })
+            await response.write(
+                f"event: token_usage.final\ndata: {final_usage_payload}\n\n".encode()
+            )
             await response.write(b"data: [DONE]\n\n")
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
             # Client disconnected mid-stream.  Interrupt the agent so it
@@ -2335,6 +2449,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
+        token_usage_callback=None,
         agent_ref: Optional[list] = None,
     ) -> tuple:
         """
@@ -2358,6 +2473,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_progress_callback=tool_progress_callback,
                 tool_start_callback=tool_start_callback,
                 tool_complete_callback=tool_complete_callback,
+                token_usage_callback=token_usage_callback,
             )
             if agent_ref is not None:
                 agent_ref[0] = agent

@@ -2591,3 +2591,105 @@ class TestSessionIdHeader:
             call_kwargs = mock_run.call_args.kwargs
             assert call_kwargs["conversation_history"] == []
             assert call_kwargs["session_id"] == "some-session"
+
+
+# ---------------------------------------------------------------------------
+# Youmake fork: structured SSE events on /v1/chat/completions
+# ---------------------------------------------------------------------------
+
+
+class TestYoumakeStructuredEvents:
+    """Verify the fork's structured ``event: tool_use.*`` and
+    ``event: token_usage.*`` lines are emitted alongside the standard
+    OpenAI ``data: {chat.completion.chunk}`` chunks.
+
+    The event prefix is invisible to stock OpenAI SDK parsers (they only
+    consume ``data:`` lines for known objects), so adding these does not
+    break compatibility — but the Youmake orchestrator can subscribe to
+    them to render tool/token state in real time without parsing
+    assistant text.
+    """
+
+    @pytest.mark.asyncio
+    async def test_tool_use_lifecycle_events_emitted(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                start_cb = kwargs.get("tool_start_callback")
+                complete_cb = kwargs.get("tool_complete_callback")
+                delta_cb = kwargs.get("stream_delta_callback")
+                if start_cb:
+                    start_cb("call_abc", "web_search", {"query": "youmake"})
+                if complete_cb:
+                    complete_cb("call_abc", "web_search", {"query": "youmake"}, "found 3 results")
+                if delta_cb:
+                    delta_cb("done")
+                    delta_cb(None)
+                return (
+                    {"final_response": "done", "messages": [], "api_calls": 1},
+                    {
+                        "input_tokens": 1, "output_tokens": 1, "total_tokens": 2,
+                        "cache_read_tokens": 0, "cache_write_tokens": 0,
+                    },
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "search"}],
+                        "stream": True,
+                    },
+                )
+                body = await resp.text()
+
+            assert "event: tool_use.started" in body
+            assert "event: tool_use.completed" in body
+            # Structured payload uses snake_case ``output_preview`` and
+            # ``duration_ms``; the orchestrator depends on these names.
+            assert "output_preview" in body
+            assert "duration_ms" in body
+            # Backward-compat: legacy hermes.tool.progress is still there.
+            assert "event: hermes.tool.progress" in body
+
+    @pytest.mark.asyncio
+    async def test_token_usage_delta_and_final_events(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                usage_cb = kwargs.get("token_usage_callback")
+                delta_cb = kwargs.get("stream_delta_callback")
+                if usage_cb:
+                    usage_cb({
+                        "input": 100, "output": 20,
+                        "cacheRead": 5000, "cacheWrite": 200, "total": 120,
+                    })
+                if delta_cb:
+                    delta_cb("ok")
+                    delta_cb(None)
+                return (
+                    {"final_response": "ok", "messages": [], "api_calls": 1},
+                    {
+                        "input_tokens": 100, "output_tokens": 20, "total_tokens": 120,
+                        "cache_read_tokens": 5000, "cache_write_tokens": 200,
+                    },
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "stream": True,
+                    },
+                )
+                body = await resp.text()
+
+            assert "event: token_usage.delta" in body
+            assert "event: token_usage.final" in body
+            assert "cacheRead" in body
+            assert "cacheWrite" in body
+            # Final usage record carries the cumulative totals.
+            assert '"total": 120' in body or '"total":120' in body
