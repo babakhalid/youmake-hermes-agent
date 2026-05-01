@@ -345,6 +345,8 @@ class TestAgentExecution:
         mock_agent.session_prompt_tokens = 1
         mock_agent.session_completion_tokens = 2
         mock_agent.session_total_tokens = 3
+        mock_agent.session_cache_read_tokens = 0
+        mock_agent.session_cache_write_tokens = 0
 
         with patch.object(adapter, "_create_agent", return_value=mock_agent):
             result, usage = await adapter._run_agent(
@@ -354,12 +356,43 @@ class TestAgentExecution:
             )
 
         assert result == {"final_response": "ok"}
-        assert usage == {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3}
+        assert usage == {
+            "input_tokens": 1,
+            "output_tokens": 2,
+            "total_tokens": 3,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+        }
         mock_agent.run_conversation.assert_called_once_with(
             user_message="hello",
             conversation_history=[],
             task_id="session-123",
         )
+
+    @pytest.mark.asyncio
+    async def test_run_agent_surfaces_cache_token_fields(self, adapter):
+        """Cache token attributes accumulated on the agent must reach the
+        usage dict so the chat-completions response can pass them through.
+        Anthropic charges 10% for cache reads — without this, callers are
+        billed full price even when the upstream call hit the cache.
+        """
+        mock_agent = MagicMock()
+        mock_agent.run_conversation.return_value = {"final_response": "ok"}
+        mock_agent.session_prompt_tokens = 100
+        mock_agent.session_completion_tokens = 50
+        mock_agent.session_total_tokens = 150
+        mock_agent.session_cache_read_tokens = 12000
+        mock_agent.session_cache_write_tokens = 800
+
+        with patch.object(adapter, "_create_agent", return_value=mock_agent):
+            _, usage = await adapter._run_agent(
+                user_message="hi",
+                conversation_history=[],
+                session_id="s1",
+            )
+
+        assert usage["cache_read_tokens"] == 12000
+        assert usage["cache_write_tokens"] == 800
 
 
 # ---------------------------------------------------------------------------
@@ -990,6 +1023,43 @@ class TestChatCompletionsEndpoint:
             assert data["choices"][0]["message"]["content"] == "Hello! How can I help you today?"
             assert data["choices"][0]["finish_reason"] == "stop"
             assert "usage" in data
+
+    @pytest.mark.asyncio
+    async def test_response_passes_through_anthropic_cache_fields(self, adapter):
+        """Anthropic cache_read_input_tokens / cache_creation_input_tokens
+        must appear in the OpenAI-compat ``usage`` object so callers can
+        bill against the cache discount Anthropic gave us upstream.
+        """
+        mock_result = {"final_response": "ok", "messages": [], "api_calls": 1}
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    mock_result,
+                    {
+                        "input_tokens": 200,
+                        "output_tokens": 50,
+                        "total_tokens": 250,
+                        "cache_read_tokens": 9000,
+                        "cache_write_tokens": 1500,
+                    },
+                )
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "hermes-agent",
+                        "messages": [{"role": "user", "content": "Hi"}],
+                    },
+                )
+
+            assert resp.status == 200
+            data = await resp.json()
+            usage = data["usage"]
+            assert usage["prompt_tokens"] == 200
+            assert usage["completion_tokens"] == 50
+            assert usage["total_tokens"] == 250
+            assert usage["cache_read_input_tokens"] == 9000
+            assert usage["cache_creation_input_tokens"] == 1500
 
     @pytest.mark.asyncio
     async def test_system_prompt_extracted(self, adapter):

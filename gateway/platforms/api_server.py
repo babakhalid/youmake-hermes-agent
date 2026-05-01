@@ -1107,6 +1107,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 "prompt_tokens": usage.get("input_tokens", 0),
                 "completion_tokens": usage.get("output_tokens", 0),
                 "total_tokens": usage.get("total_tokens", 0),
+                # Anthropic cache token passthrough — surfaces caching savings
+                # to OpenAI-compatible clients without breaking the schema
+                # (clients ignore unknown usage fields).
+                "cache_read_input_tokens": usage.get("cache_read_tokens", 0),
+                "cache_creation_input_tokens": usage.get("cache_write_tokens", 0),
             },
         }
 
@@ -1205,7 +1210,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 last_activity = await _emit(delta)
 
             # Get usage from completed agent
-            usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+            usage = {
+                "input_tokens": 0, "output_tokens": 0, "total_tokens": 0,
+                "cache_read_tokens": 0, "cache_write_tokens": 0,
+            }
             try:
                 result, agent_usage = await agent_task
                 usage = agent_usage or usage
@@ -1221,6 +1229,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     "prompt_tokens": usage.get("input_tokens", 0),
                     "completion_tokens": usage.get("output_tokens", 0),
                     "total_tokens": usage.get("total_tokens", 0),
+                    "cache_read_input_tokens": usage.get("cache_read_tokens", 0),
+                    "cache_creation_input_tokens": usage.get("cache_write_tokens", 0),
                 },
             }
             await response.write(f"data: {json.dumps(finish_chunk)}\n\n".encode())
@@ -2361,6 +2371,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
                 "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
                 "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
+                "cache_read_tokens": getattr(agent, "session_cache_read_tokens", 0) or 0,
+                "cache_write_tokens": getattr(agent, "session_cache_write_tokens", 0) or 0,
             }
             return result, usage
 
