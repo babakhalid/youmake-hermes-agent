@@ -141,6 +141,62 @@ DEFAULT_AGENT_IDENTITY = (
     "Be targeted and efficient in your exploration and investigations."
 )
 
+# Youmake fork: identity-template selector.
+# - "youmake_minimal" (default): slim ~1-2K-token persona shipped with the
+#   fork in templates/soul-youmake-minimal.md.  Skips the multi-K-token
+#   skill catalog, tool-use enforcement guidance, model-specific operator
+#   guidance, and project context-files block — the slim deployment surface
+#   doesn't need them and pays full token cost on every uncached turn.
+# - "hermes_full": original upstream behaviour.
+# Override via env var HERMES_IDENTITY_TEMPLATE.
+IDENTITY_TEMPLATE_ENV = "HERMES_IDENTITY_TEMPLATE"
+IDENTITY_TEMPLATE_DEFAULT = "youmake_minimal"
+IDENTITY_TEMPLATE_FULL = "hermes_full"
+
+YOUMAKE_FALLBACK_IDENTITY = (
+    "You are Youmake Agent, a focused AI assistant deployed inside the Youmake "
+    "platform. You help one user at a time on their personal cloud workspace, "
+    "running real tools (web search, terminal, files, planning) to accomplish "
+    "their request end-to-end. Be direct: state your conclusion or next action "
+    "first, expand only when asked. Prefer doing over describing — when you "
+    "have the tool, use it. Verify before claiming completion. Keep responses "
+    "scoped to what was asked. Don't invent URLs, file paths, or APIs; look "
+    "them up. Don't claim to have done work you didn't do."
+)
+
+
+def get_identity_template_name() -> str:
+    """Return the active identity template name.
+
+    Reads ``HERMES_IDENTITY_TEMPLATE`` and falls back to
+    ``IDENTITY_TEMPLATE_DEFAULT``.  Unknown values are coerced to the
+    default so a typo can't silently disable identity loading.
+    """
+    raw = (os.getenv(IDENTITY_TEMPLATE_ENV) or "").strip().lower()
+    if raw in (IDENTITY_TEMPLATE_DEFAULT, IDENTITY_TEMPLATE_FULL):
+        return raw
+    return IDENTITY_TEMPLATE_DEFAULT
+
+
+def load_packaged_identity_template(name: str) -> Optional[str]:
+    """Load a packaged identity template (e.g. ``youmake-minimal``) shipped
+    with the fork at ``<repo_root>/templates/soul-<name>.md``.
+
+    Returns ``None`` when the file is missing or empty so the caller can
+    fall through to the hardcoded constant.  Walks up from this module's
+    location so the lookup works in both editable and wheel installs.
+    """
+    try:
+        repo_root = Path(__file__).resolve().parent.parent
+        path = repo_root / "templates" / f"soul-{name}.md"
+        if not path.exists():
+            return None
+        content = path.read_text(encoding="utf-8").strip()
+        return content or None
+    except Exception as e:
+        logger.debug("Could not read identity template %s: %s", name, e)
+        return None
+
 HERMES_AGENT_HELP_GUIDANCE = (
     "If the user asks about configuring, setting up, or using Hermes Agent "
     "itself, load the `hermes-agent` skill with skill_view(name='hermes-agent') "

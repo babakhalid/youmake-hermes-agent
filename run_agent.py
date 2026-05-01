@@ -148,7 +148,7 @@ from agent.model_metadata import (
 from agent.context_compressor import ContextCompressor
 from agent.subdirectory_hints import SubdirectoryHintTracker
 from agent.prompt_caching import apply_anthropic_cache_control
-from agent.prompt_builder import build_skills_system_prompt, build_context_files_prompt, build_environment_hints, load_soul_md, TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE, OPENAI_MODEL_EXECUTION_GUIDANCE
+from agent.prompt_builder import build_skills_system_prompt, build_context_files_prompt, build_environment_hints, load_soul_md, TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE, OPENAI_MODEL_EXECUTION_GUIDANCE, get_identity_template_name, load_packaged_identity_template, IDENTITY_TEMPLATE_FULL, YOUMAKE_FALLBACK_IDENTITY
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from agent.codex_responses_adapter import (
     _derive_responses_function_call_id as _codex_derive_responses_function_call_id,
@@ -4807,7 +4807,7 @@ class AIAgent:
     def _build_system_prompt(self, system_message: str = None) -> str:
         """
         Assemble the full system prompt from all layers.
-        
+
         Called once per session (cached on self._cached_system_prompt) and only
         rebuilt after context compression events. This ensures the system prompt
         is stable across all turns in a session, maximizing prefix cache hits.
@@ -4821,6 +4821,16 @@ class AIAgent:
         #   6. Current date & time (frozen at build time)
         #   7. Platform-specific formatting hint
 
+        # Youmake fork: identity-template selector.  When set to
+        # ``youmake_minimal`` (default), assemble a slim system prompt:
+        # packaged identity → memory → timestamp → env/platform hints.
+        # The skill catalog, tool-use enforcement guidance, model-specific
+        # operator guidance, and project context-files block are skipped
+        # because the deployed surface (Youmake VM, fixed toolset) doesn't
+        # need them and pays full token cost on every uncached turn.
+        _identity_template = get_identity_template_name()
+        _is_minimal = _identity_template != IDENTITY_TEMPLATE_FULL
+
         # Try SOUL.md as primary identity unless the caller explicitly skipped it.
         # Some execution modes (cron) still want HERMES_HOME persona while keeping
         # cwd project instructions disabled.
@@ -4832,11 +4842,19 @@ class AIAgent:
                 _soul_loaded = True
 
         if not _soul_loaded:
-            # Fallback to hardcoded identity
-            prompt_parts = [DEFAULT_AGENT_IDENTITY]
+            if _is_minimal:
+                # Packaged minimal template → fallback constant if missing.
+                _packaged = load_packaged_identity_template("youmake-minimal")
+                prompt_parts = [_packaged or YOUMAKE_FALLBACK_IDENTITY]
+            else:
+                # Fallback to hardcoded identity
+                prompt_parts = [DEFAULT_AGENT_IDENTITY]
 
         # Pointer to the hermes-agent skill + docs for user questions about Hermes itself.
-        prompt_parts.append(HERMES_AGENT_HELP_GUIDANCE)
+        # Skipped under youmake_minimal — the slim deployment doesn't expose
+        # the hermes-agent skill, and the help text is Hermes-specific.
+        if not _is_minimal:
+            prompt_parts.append(HERMES_AGENT_HELP_GUIDANCE)
 
         # Tool-aware behavioral guidance: only inject when the tools are loaded
         tool_guidance = []
@@ -4865,7 +4883,10 @@ class AIAgent:
         #   true  — always inject (all models)
         #   false — never inject
         #   list  — custom model-name substrings to match
-        if self.valid_tool_names:
+        # Skipped under youmake_minimal — the slim template's "Tool use"
+        # section already covers this and Anthropic Claude (the only model
+        # the Youmake deployment uses) doesn't need the enforcement nag.
+        if self.valid_tool_names and not _is_minimal:
             _enforce = self._tool_use_enforcement
             _inject = False
             if _enforce is True or (isinstance(_enforce, str) and _enforce.lower() in ("true", "always", "yes", "on")):
@@ -4918,7 +4939,14 @@ class AIAgent:
             except Exception:
                 pass
 
-        has_skills_tools = any(name in self.valid_tool_names for name in ['skills_list', 'skill_view', 'skill_manage'])
+        # Skill catalog (the largest single block — multi-K tokens listing
+        # every available skill).  Skipped under youmake_minimal because the
+        # fixed Youmake toolset doesn't expose the skill_* tools and the
+        # catalog would only inflate the cached prefix.
+        has_skills_tools = (
+            not _is_minimal
+            and any(name in self.valid_tool_names for name in ['skills_list', 'skill_view', 'skill_manage'])
+        )
         if has_skills_tools:
             avail_toolsets = {
                 toolset
@@ -4936,7 +4964,11 @@ class AIAgent:
         if skills_prompt:
             prompt_parts.append(skills_prompt)
 
-        if not self.skip_context_files:
+        # Project context files (.hermes.md, AGENTS.md, .cursorrules) — also
+        # skipped under youmake_minimal.  In the gateway deployment the
+        # working dir is the agent install root, so these would inject
+        # the fork's own dev docs into every user turn (~10K tokens).
+        if not self.skip_context_files and not _is_minimal:
             # Use TERMINAL_CWD for context file discovery when set (gateway
             # mode).  The gateway process runs from the hermes-agent install
             # dir, so os.getcwd() would pick up the repo's AGENTS.md and
