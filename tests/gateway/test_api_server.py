@@ -319,6 +319,10 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_post("/v1/responses", adapter._handle_responses)
     app.router.add_get("/v1/responses/{response_id}", adapter._handle_get_response)
     app.router.add_delete("/v1/responses/{response_id}", adapter._handle_delete_response)
+    # Youmake fork: per-session endpoints.
+    app.router.add_post(
+        "/v1/sessions/{session_id}/approval", adapter._handle_session_approval,
+    )
     return app
 
 
@@ -2693,3 +2697,105 @@ class TestYoumakeStructuredEvents:
             assert "cacheWrite" in body
             # Final usage record carries the cumulative totals.
             assert '"total": 120' in body or '"total":120' in body
+
+
+# ---------------------------------------------------------------------------
+# Youmake fork: POST /v1/sessions/{session_id}/approval
+# ---------------------------------------------------------------------------
+
+
+class TestYoumakeSessionApproval:
+    """Resolves a pending dangerous-command approval that the agent is
+    blocking on.  The endpoint maps {decision, remember} → the choice
+    string accepted by ``tools.approval.resolve_gateway_approval``.
+    """
+
+    def setup_method(self):
+        # Ensure a clean approval state between tests — _gateway_queues
+        # is module-level and persists across the suite.
+        from tools import approval as _approval_mod
+        with _approval_mod._lock:
+            _approval_mod._gateway_queues.clear()
+            _approval_mod._gateway_notify_cbs.clear()
+
+    @pytest.mark.asyncio
+    async def test_returns_404_when_no_pending_approval(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/sessions/session-x/approval",
+                json={"request_id": "r1", "decision": "approve"},
+            )
+            assert resp.status == 404
+
+    @pytest.mark.asyncio
+    async def test_invalid_decision_returns_400(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/sessions/sx/approval",
+                json={"request_id": "r1", "decision": "maybe"},
+            )
+            assert resp.status == 400
+
+    @pytest.mark.asyncio
+    async def test_approve_resolves_pending_entry(self, adapter):
+        from tools import approval as _approval_mod
+
+        # Register a fake pending entry as if the agent was blocking.
+        entry = _approval_mod._ApprovalEntry({"command": "rm -rf /tmp/x", "description": "rm -rf"})
+        with _approval_mod._lock:
+            _approval_mod._gateway_queues.setdefault("session-y", []).append(entry)
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/sessions/session-y/approval",
+                json={"request_id": "r1", "decision": "approve", "remember": False},
+            )
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["resolved"] == 1
+            assert data["choice"] == "once"
+            assert data["session_id"] == "session-y"
+            assert data["request_id"] == "r1"
+
+        # The agent thread would now see entry.event set with result="once".
+        assert entry.event.is_set()
+        assert entry.result == "once"
+
+    @pytest.mark.asyncio
+    async def test_approve_with_remember_uses_session_choice(self, adapter):
+        from tools import approval as _approval_mod
+        entry = _approval_mod._ApprovalEntry({"command": "x", "description": "y"})
+        with _approval_mod._lock:
+            _approval_mod._gateway_queues.setdefault("sk", []).append(entry)
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/sessions/sk/approval",
+                json={"decision": "approve", "remember": True},
+            )
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["choice"] == "session"
+        assert entry.result == "session"
+
+    @pytest.mark.asyncio
+    async def test_deny_resolves_with_deny_choice(self, adapter):
+        from tools import approval as _approval_mod
+        entry = _approval_mod._ApprovalEntry({"command": "x", "description": "y"})
+        with _approval_mod._lock:
+            _approval_mod._gateway_queues.setdefault("sk2", []).append(entry)
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/sessions/sk2/approval",
+                json={"decision": "deny"},
+            )
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["choice"] == "deny"
+        assert entry.result == "deny"

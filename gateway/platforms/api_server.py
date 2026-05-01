@@ -595,6 +595,9 @@ class APIServerAdapter(BasePlatformAdapter):
         # Pollable run status for dashboards and external control-plane UIs.
         self._run_statuses: Dict[str, Dict[str, Any]] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
+        # Youmake fork: session_ids that have an approval-notify callback
+        # registered, so we can unregister on stream end / disconnect.
+        self._approval_notify_sessions: set[str] = set()
 
     @staticmethod
     def _parse_cors_origins(value: Any) -> tuple[str, ...]:
@@ -1095,6 +1098,38 @@ class APIServerAdapter(BasePlatformAdapter):
                 except Exception:
                     pass
 
+            # Youmake fork: bridge the agent's gateway-approval queue to
+            # the SSE stream.  When the agent hits a dangerous command,
+            # ``tools.approval._check_all_guards`` fires this callback and
+            # blocks the agent thread on a per-session queue entry.  We
+            # publish an ``approval.request`` event so the orchestrator
+            # can show the user a confirm/deny dialog and then call
+            # POST /v1/sessions/{session_id}/approval to unblock the
+            # agent.
+            from tools.approval import (
+                register_gateway_notify,
+                unregister_gateway_notify,
+            )
+
+            def _on_approval_request(approval_data: dict) -> None:
+                payload = {
+                    "request_id": uuid.uuid4().hex,
+                    "session_id": session_id,
+                    "tool": "terminal",
+                    "command": approval_data.get("command", ""),
+                    "reason": approval_data.get("description", ""),
+                    "pattern_keys": approval_data.get("pattern_keys", []),
+                    "severity": "high",
+                    "blocking": True,
+                }
+                try:
+                    _stream_q.put(("__approval_request__", payload))
+                except Exception:
+                    logger.debug("Failed to enqueue approval request", exc_info=True)
+
+            register_gateway_notify(session_id, _on_approval_request)
+            self._approval_notify_sessions.add(session_id)
+
             # Start agent in background.  agent_ref is a mutable container
             # so the SSE writer can interrupt the agent on client disconnect.
             #
@@ -1366,6 +1401,18 @@ class APIServerAdapter(BasePlatformAdapter):
                 except (asyncio.CancelledError, Exception):
                     pass
             logger.info("SSE client disconnected; interrupted agent task %s", completion_id)
+        finally:
+            # Youmake fork: drop the per-session approval-notify callback
+            # so a future disconnect-then-reconnect doesn't double-fire
+            # SSE events into a stale (closed) queue.  Also signals any
+            # blocked agent thread waiting on approval — without this,
+            # the agent would idle until the gateway timeout (5 min).
+            if session_id and session_id in self._approval_notify_sessions:
+                try:
+                    from tools.approval import unregister_gateway_notify
+                    unregister_gateway_notify(session_id)
+                finally:
+                    self._approval_notify_sessions.discard(session_id)
 
         return response
 
@@ -2466,31 +2513,52 @@ class APIServerAdapter(BasePlatformAdapter):
         loop = asyncio.get_running_loop()
 
         def _run():
-            agent = self._create_agent(
-                ephemeral_system_prompt=ephemeral_system_prompt,
-                session_id=session_id,
-                stream_delta_callback=stream_delta_callback,
-                tool_progress_callback=tool_progress_callback,
-                tool_start_callback=tool_start_callback,
-                tool_complete_callback=tool_complete_callback,
-                token_usage_callback=token_usage_callback,
-            )
-            if agent_ref is not None:
-                agent_ref[0] = agent
-            effective_task_id = session_id or str(uuid.uuid4())
-            result = agent.run_conversation(
-                user_message=user_message,
-                conversation_history=conversation_history,
-                task_id=effective_task_id,
-            )
-            usage = {
-                "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
-                "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
-                "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
-                "cache_read_tokens": getattr(agent, "session_cache_read_tokens", 0) or 0,
-                "cache_write_tokens": getattr(agent, "session_cache_write_tokens", 0) or 0,
-            }
-            return result, usage
+            # Youmake fork: bind the approval session contextvar to this
+            # thread's context so dangerous commands look up the right
+            # gateway-approval queue when ``_check_all_guards`` runs.
+            # Reset on the way out so test isolation isn't broken by
+            # leaked context state.
+            _approval_token = None
+            if session_id:
+                try:
+                    from tools.approval import set_current_session_key
+                    _approval_token = set_current_session_key(session_id)
+                except Exception:
+                    _approval_token = None
+
+            try:
+                agent = self._create_agent(
+                    ephemeral_system_prompt=ephemeral_system_prompt,
+                    session_id=session_id,
+                    stream_delta_callback=stream_delta_callback,
+                    tool_progress_callback=tool_progress_callback,
+                    tool_start_callback=tool_start_callback,
+                    tool_complete_callback=tool_complete_callback,
+                    token_usage_callback=token_usage_callback,
+                )
+                if agent_ref is not None:
+                    agent_ref[0] = agent
+                effective_task_id = session_id or str(uuid.uuid4())
+                result = agent.run_conversation(
+                    user_message=user_message,
+                    conversation_history=conversation_history,
+                    task_id=effective_task_id,
+                )
+                usage = {
+                    "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
+                    "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
+                    "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
+                    "cache_read_tokens": getattr(agent, "session_cache_read_tokens", 0) or 0,
+                    "cache_write_tokens": getattr(agent, "session_cache_write_tokens", 0) or 0,
+                }
+                return result, usage
+            finally:
+                if _approval_token is not None:
+                    try:
+                        from tools.approval import reset_current_session_key
+                        reset_current_session_key(_approval_token)
+                    except Exception:
+                        pass
 
         return await loop.run_in_executor(None, _run)
 
@@ -2825,6 +2893,70 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return response
 
+    # ------------------------------------------------------------------
+    # Youmake fork: per-session approval + usage endpoints
+    # ------------------------------------------------------------------
+
+    async def _handle_session_approval(self, request: "web.Request") -> "web.Response":
+        """POST /v1/sessions/{session_id}/approval.
+
+        Resolve a pending dangerous-command approval that the agent is
+        blocking on.  Body: ``{request_id, decision: "approve"|"deny",
+        remember?: bool}``.  ``request_id`` is for client-side
+        correlation (matches the ``approval.request`` SSE event id);
+        server-side resolution is FIFO via
+        ``tools.approval.resolve_gateway_approval``.
+
+        ``remember=True`` on an ``approve`` maps to choice ``"session"``
+        (this pattern auto-approves for the rest of the session);
+        otherwise ``"once"``.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        session_id = request.match_info.get("session_id") or ""
+        if not session_id:
+            return web.json_response(_openai_error("Missing session_id"), status=400)
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+
+        decision = (body.get("decision") or "").strip().lower()
+        request_id = body.get("request_id", "")
+        remember = bool(body.get("remember", False))
+
+        if decision == "approve":
+            choice = "session" if remember else "once"
+        elif decision == "deny":
+            choice = "deny"
+        else:
+            return web.json_response(
+                _openai_error("decision must be 'approve' or 'deny'"),
+                status=400,
+            )
+
+        from tools.approval import has_blocking_approval, resolve_gateway_approval
+
+        if not has_blocking_approval(session_id):
+            return web.json_response(
+                _openai_error(f"No pending approval for session {session_id}",
+                              code="approval_not_found"),
+                status=404,
+            )
+
+        resolved = resolve_gateway_approval(session_id, choice, resolve_all=False)
+        return web.json_response({
+            "object": "approval.resolved",
+            "session_id": session_id,
+            "request_id": request_id,
+            "decision": decision,
+            "choice": choice,
+            "resolved": resolved,
+        })
+
     async def _handle_stop_run(self, request: "web.Request") -> "web.Response":
         """POST /v1/runs/{run_id}/stop — interrupt a running agent."""
         auth_err = self._check_auth(request)
@@ -2928,6 +3060,21 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/runs/{run_id}", self._handle_get_run)
             self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
             self._app.router.add_post("/v1/runs/{run_id}/stop", self._handle_stop_run)
+            # Youmake fork: per-session approval endpoint.  See
+            # _handle_session_approval below.
+            self._app.router.add_post(
+                "/v1/sessions/{session_id}/approval",
+                self._handle_session_approval,
+            )
+            # Enable gateway-mode dangerous-command approval for every
+            # request in this process.  When the chat-completions handler
+            # registers a per-session notify_cb, dangerous tools block on
+            # the gateway queue instead of returning the legacy
+            # ``approval_required`` text — letting the orchestrator drive
+            # the decision via /v1/sessions/{id}/approval.  Requests that
+            # don't register a callback fall through to the legacy text
+            # path, so this is safe to set globally for the api_server.
+            os.environ.setdefault("HERMES_GATEWAY_SESSION", "1")
             # Start background sweep to clean up orphaned (unconsumed) run streams
             sweep_task = asyncio.create_task(self._sweep_orphaned_runs())
             try:
