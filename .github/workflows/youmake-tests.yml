@@ -1,0 +1,61 @@
+name: Youmake Fork Tests
+
+# Fast-feedback workflow that runs only the youmake-customizations
+# regression tests. The upstream Tests workflow (.github/workflows/
+# tests.yml) keeps running the full suite on every push/PR.
+
+on:
+  push:
+    branches: [main, youmake-customizations]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+  pull_request:
+    branches: [main, youmake-customizations]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: youmake-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  youmake-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86  # v5
+
+      - name: Set up Python 3.11
+        run: uv python install 3.11
+
+      - name: Install dependencies
+        run: |
+          uv venv .venv --python 3.11
+          source .venv/bin/activate
+          uv pip install -e ".[dev]"
+
+      - name: Run youmake fork tests
+        run: |
+          source .venv/bin/activate
+          python -m pytest \
+            tests/test_identity_template.py \
+            tests/test_youmake_chat_preset.py \
+            tests/gateway/test_api_server.py::TestAgentExecution \
+            tests/gateway/test_api_server.py::TestChatCompletionsEndpoint \
+            tests/gateway/test_api_server.py::TestYoumakeStructuredEvents \
+            tests/gateway/test_api_server.py::TestYoumakeSessionApproval \
+            tests/gateway/test_api_server.py::TestYoumakeSessionUsage \
+            -v --tb=short -n auto
+        env:
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
