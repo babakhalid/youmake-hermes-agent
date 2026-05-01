@@ -178,6 +178,18 @@ def get_identity_template_name() -> str:
     return IDENTITY_TEMPLATE_DEFAULT
 
 
+def get_user_facing_brand() -> str:
+    """Return the agent's user-facing display name.
+
+    Used in error messages and other surfaces the user reads.  Returns
+    ``"Youmake Agent"`` under the default ``youmake_minimal`` template
+    and ``"Hermes Agent"`` under ``hermes_full``.  Internal package
+    names (``hermes-agent``, the Python module names, the OpenRouter
+    referrer header, etc.) are intentionally left untouched.
+    """
+    return "Hermes Agent" if get_identity_template_name() == IDENTITY_TEMPLATE_FULL else "Youmake Agent"
+
+
 def load_packaged_identity_template(name: str) -> Optional[str]:
     """Load a packaged identity template (e.g. ``youmake-minimal``) shipped
     with the fork at ``<repo_root>/templates/soul-<name>.md``.

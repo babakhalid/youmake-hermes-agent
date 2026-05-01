@@ -19,6 +19,7 @@ from agent.prompt_builder import (
     IDENTITY_TEMPLATE_FULL,
     YOUMAKE_FALLBACK_IDENTITY,
     get_identity_template_name,
+    get_user_facing_brand,
     load_packaged_identity_template,
 )
 
@@ -41,6 +42,16 @@ class TestIdentityTemplateSelector:
     def test_case_insensitive(self, monkeypatch):
         monkeypatch.setenv(IDENTITY_TEMPLATE_ENV, "HERMES_FULL")
         assert get_identity_template_name() == IDENTITY_TEMPLATE_FULL
+
+
+class TestUserFacingBrand:
+    def test_default_template_brands_as_youmake(self, monkeypatch):
+        monkeypatch.delenv(IDENTITY_TEMPLATE_ENV, raising=False)
+        assert get_user_facing_brand() == "Youmake Agent"
+
+    def test_full_template_brands_as_hermes(self, monkeypatch):
+        monkeypatch.setenv(IDENTITY_TEMPLATE_ENV, IDENTITY_TEMPLATE_FULL)
+        assert get_user_facing_brand() == "Hermes Agent"
 
 
 class TestPackagedTemplateLoad:
