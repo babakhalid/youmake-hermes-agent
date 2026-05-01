@@ -167,7 +167,17 @@ TOOLSETS = {
         "tools": ["todo"],
         "includes": []
     },
-    
+
+    # Youmake fork: focused chat-product toolset.  Composed of the four
+    # building blocks (web, terminal, file, todo) so the deployed VM
+    # ships with exactly the tools the chat surface advertises — no
+    # cloud-init YAML surgery to enable / disable extras post-install.
+    "youmake-chat": {
+        "description": "Youmake chat surface: web research, terminal, file ops, and task planning",
+        "tools": [],
+        "includes": ["web", "terminal", "file", "todo"],
+    },
+
     "memory": {
         "description": "Persistent memory across sessions (personal notes + user profile)",
         "tools": ["memory"],
