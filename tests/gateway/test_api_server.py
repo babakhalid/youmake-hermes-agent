@@ -323,6 +323,9 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_post(
         "/v1/sessions/{session_id}/approval", adapter._handle_session_approval,
     )
+    app.router.add_get(
+        "/v1/sessions/{session_id}/usage", adapter._handle_session_usage,
+    )
     return app
 
 
@@ -2799,3 +2802,80 @@ class TestYoumakeSessionApproval:
             data = await resp.json()
             assert data["choice"] == "deny"
         assert entry.result == "deny"
+
+
+# ---------------------------------------------------------------------------
+# Youmake fork: GET /v1/sessions/{session_id}/usage
+# ---------------------------------------------------------------------------
+
+
+class TestYoumakeSessionUsage:
+    @pytest.mark.asyncio
+    async def test_returns_404_when_session_missing(self, adapter):
+        # Stub a SessionDB that returns None for the lookup.
+        fake_db = MagicMock()
+        fake_db.get_session.return_value = None
+        adapter._session_db = fake_db
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/sessions/missing-id/usage")
+            assert resp.status == 404
+
+    @pytest.mark.asyncio
+    async def test_returns_503_when_session_db_unavailable(self, adapter):
+        adapter._session_db = None
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch("hermes_state.SessionDB", side_effect=Exception("no db")):
+                resp = await cli.get("/v1/sessions/x/usage")
+                assert resp.status == 503
+
+    @pytest.mark.asyncio
+    async def test_returns_session_usage_with_tool_calls(self, adapter):
+        fake_db = MagicMock()
+        fake_db.get_session.return_value = {
+            "id": "sess-7",
+            "input_tokens": 1234,
+            "output_tokens": 567,
+            "cache_read_tokens": 9000,
+            "cache_write_tokens": 200,
+            "message_count": 4,
+            "tool_call_count": 3,
+        }
+        fake_db.get_messages.return_value = [
+            {
+                "timestamp": 100,
+                "tool_calls": [
+                    {"id": "call_1", "function": {"name": "web_search"}},
+                ],
+            },
+            {
+                "timestamp": 200,
+                "tool_calls": [
+                    {"id": "call_2", "function": {"name": "terminal"}},
+                    {"id": "call_3", "function": {"name": "read_file"}},
+                ],
+            },
+        ]
+        adapter._session_db = fake_db
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/sessions/sess-7/usage")
+            assert resp.status == 200
+            data = await resp.json()
+
+        assert data["object"] == "session.usage"
+        assert data["session_id"] == "sess-7"
+        assert data["input_tokens"] == 1234
+        assert data["output_tokens"] == 567
+        assert data["cache_read_input_tokens"] == 9000
+        assert data["cache_creation_input_tokens"] == 200
+        assert data["total_tokens"] == 1234 + 567
+        assert data["message_count"] == 4
+        assert data["tool_call_count"] == 3
+        assert len(data["tool_calls"]) == 3
+        assert data["tool_calls"][0]["tool"] == "web_search"
+        assert data["tool_calls"][0]["id"] == "call_1"
+        assert data["tool_calls"][2]["tool"] == "read_file"

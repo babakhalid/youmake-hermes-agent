@@ -2957,6 +2957,78 @@ class APIServerAdapter(BasePlatformAdapter):
             "resolved": resolved,
         })
 
+    async def _handle_session_usage(self, request: "web.Request") -> "web.Response":
+        """GET /v1/sessions/{session_id}/usage.
+
+        Return the cumulative token counts and tool-call list for a
+        session.  Reads from the persistent SessionDB so the orchestrator
+        can render a live token-spend badge independent of any active
+        SSE stream.
+
+        The shape mirrors the chat-completions ``usage`` object plus the
+        Anthropic cache-token fields (so the same accounting code on the
+        caller side works for both per-request and per-session views).
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        session_id = request.match_info.get("session_id") or ""
+        if not session_id:
+            return web.json_response(_openai_error("Missing session_id"), status=400)
+
+        db = self._ensure_session_db()
+        if db is None:
+            return web.json_response(
+                _openai_error("SessionDB unavailable", code="db_unavailable"),
+                status=503,
+            )
+
+        try:
+            session = db.get_session(session_id)
+        except Exception as e:
+            logger.debug("get_session failed for %s: %s", session_id, e)
+            session = None
+
+        if not session:
+            return web.json_response(
+                _openai_error(f"Session not found: {session_id}", code="session_not_found"),
+                status=404,
+            )
+
+        tool_calls: List[Dict[str, Any]] = []
+        try:
+            for msg in db.get_messages(session_id):
+                for tc in (msg.get("tool_calls") or []):
+                    if not isinstance(tc, dict):
+                        continue
+                    fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+                    tool_calls.append({
+                        "id": tc.get("id") or tc.get("call_id"),
+                        "tool": (fn or {}).get("name") or tc.get("name"),
+                        "timestamp": msg.get("timestamp"),
+                    })
+        except Exception as e:
+            logger.debug("Failed to list tool calls for %s: %s", session_id, e)
+
+        in_tok = int(session.get("input_tokens") or 0)
+        out_tok = int(session.get("output_tokens") or 0)
+        cache_read = int(session.get("cache_read_tokens") or 0)
+        cache_write = int(session.get("cache_write_tokens") or 0)
+
+        return web.json_response({
+            "object": "session.usage",
+            "session_id": session_id,
+            "input_tokens": in_tok,
+            "output_tokens": out_tok,
+            "cache_read_input_tokens": cache_read,
+            "cache_creation_input_tokens": cache_write,
+            "total_tokens": in_tok + out_tok,
+            "message_count": int(session.get("message_count") or 0),
+            "tool_call_count": int(session.get("tool_call_count") or 0),
+            "tool_calls": tool_calls,
+        })
+
     async def _handle_stop_run(self, request: "web.Request") -> "web.Response":
         """POST /v1/runs/{run_id}/stop — interrupt a running agent."""
         auth_err = self._check_auth(request)
@@ -3060,11 +3132,14 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/runs/{run_id}", self._handle_get_run)
             self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
             self._app.router.add_post("/v1/runs/{run_id}/stop", self._handle_stop_run)
-            # Youmake fork: per-session approval endpoint.  See
-            # _handle_session_approval below.
+            # Youmake fork: per-session approval + usage endpoints.
             self._app.router.add_post(
                 "/v1/sessions/{session_id}/approval",
                 self._handle_session_approval,
+            )
+            self._app.router.add_get(
+                "/v1/sessions/{session_id}/usage",
+                self._handle_session_usage,
             )
             # Enable gateway-mode dangerous-command approval for every
             # request in this process.  When the chat-completions handler
