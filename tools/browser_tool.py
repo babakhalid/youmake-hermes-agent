@@ -1917,6 +1917,12 @@ def _run_browser_command(
         timeout = _get_command_timeout()
     args = args or []
 
+    # Youmake fork: computer-use permission before anything touches the desktop.
+    from tools.youmake_computer_permission import gate_browser_command
+    blocked = gate_browser_command(task_id, command, args)
+    if blocked is not None:
+        return blocked
+
     # Build the command
     try:
         browser_cmd = _find_agent_browser()

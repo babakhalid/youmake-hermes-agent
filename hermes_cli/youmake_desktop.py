@@ -858,6 +858,38 @@ def cmd_rotate_tokens(args: argparse.Namespace, runner: Optional[Runner] = None)
     return 0
 
 
+def cmd_permission(args: argparse.Namespace) -> int:
+    """Show the computer-use permission file and the decision for an agent/run.
+
+    Read-only: the Youmake server owns ``~/.hermes/desktop/permissions.json``.
+    Its presence also tells Youmake that this runtime enforces the permission.
+    """
+    from tools.youmake_computer_permission import describe
+    from tools.youmake_identity import SLUG_RE, parse_youmake_user
+
+    run = args.run or None
+    agent = args.agent or None
+    if run:
+        parsed = parse_youmake_user(run)
+        if parsed is None:
+            raise DesktopError(f"invalid --run {run!r} (expected youmake:<userId>:<slug>:<lane>)")
+        agent = agent or parsed.slug
+    if agent is not None and not SLUG_RE.fullmatch(agent):
+        raise DesktopError(f"invalid --agent {agent!r}")
+    payload = describe(agent or "hermes", run)
+    state = payload["state"]
+    lines = [
+        f"file: {payload['file']} ({payload['file_status']})",
+        f"desktop mode: {'on' if payload['desktop_mode'] else 'off'}",
+        f"mode: {state['mode']}",
+        f"agents: {json.dumps(state['agents'])}",
+        f"active one-time grants: {len(state['once'])}",
+        f"decision for {payload['agent']}{' / ' + run if run else ''}: {payload['decision']}",
+    ]
+    _emit(payload, args.json, lines)
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # argparse wiring
 # ---------------------------------------------------------------------------
@@ -919,3 +951,14 @@ def register_cli(parent: argparse.ArgumentParser) -> None:
     p = subs.add_parser("rotate-tokens", help="Issue new view/control websockify tokens")
     _json(p)
     p.set_defaults(func=_wrap(cmd_rotate_tokens))
+
+    p = subs.add_parser(
+        "permission",
+        help="Show the computer-use permission and the decision for an agent/run (read-only)",
+    )
+    p.add_argument("action", nargs="?", choices=["show", "check"], default="show",
+                   help="show (default) or check; both print the same payload")
+    p.add_argument("--agent", default="", help="Agent slug (default: from --run, else hermes)")
+    p.add_argument("--run", default="", help="Run key youmake:<userId>:<slug>:<lane>")
+    _json(p)
+    p.set_defaults(func=_wrap(cmd_permission))

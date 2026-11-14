@@ -1509,7 +1509,9 @@ def _run_single_child(
                 task_id=child_task_id,
             )
 
-        _child_future = _timeout_executor.submit(_run_with_thread_capture)
+        # Youmake fork: the child acts for the same Youmake run as its parent.
+        from tools.youmake_identity import propagate as _ym_propagate
+        _child_future = _timeout_executor.submit(_ym_propagate(_run_with_thread_capture))
         try:
             result = _child_future.result(timeout=child_timeout)
         except Exception as _timeout_exc:
@@ -2098,11 +2100,13 @@ def delegate_task(
         completed_count = 0
         spinner_ref = getattr(parent_agent, "_delegate_spinner", None)
 
+        from tools.youmake_identity import propagate as _ym_propagate
+
         with ThreadPoolExecutor(max_workers=max_children) as executor:
             futures = {}
             for i, t, child in children:
                 future = executor.submit(
-                    _run_single_child,
+                    _ym_propagate(_run_single_child),  # Youmake fork: keep the run key
                     task_index=i,
                     goal=t["goal"],
                     child=child,

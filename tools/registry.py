@@ -397,6 +397,12 @@ class ToolRegistry:
         entry = self.get_entry(name)
         if not entry:
             return json.dumps({"error": f"Unknown tool: {name}"})
+        if name.startswith("browser_"):
+            # Youmake fork: computer-use permission for the desktop browser.
+            from tools.youmake_computer_permission import gate_tool_call
+            blocked = gate_tool_call(name, args, kwargs.get("task_id"))
+            if blocked is not None:
+                return blocked
         try:
             if entry.is_async:
                 from model_tools import _run_async

@@ -1692,6 +1692,11 @@ class APIServerAdapter(BasePlatformAdapter):
 
         stream = _coerce_request_bool(body.get("stream"), default=False)
 
+        # Youmake fork: bind the run key (``user`` = youmake:<uid>:<slug>:<lane>)
+        # for this request; always set so keep-alive requests never inherit.
+        from tools.youmake_identity import bind_request_user
+        bind_request_user(body.get("user"))
+
         # Extract system message (becomes ephemeral system prompt layered ON TOP of core)
         system_prompt = None
         conversation_messages: List[Dict[str, str]] = []
@@ -3636,7 +3641,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     except Exception:
                         pass
 
-        return await loop.run_in_executor(None, _run)
+        # Youmake fork: carry the request's run key into the executor thread.
+        from tools.youmake_identity import propagate
+        return await loop.run_in_executor(None, propagate(_run))
 
     # ------------------------------------------------------------------
     # /v1/runs — structured event streaming
