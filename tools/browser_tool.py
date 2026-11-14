@@ -293,7 +293,7 @@ def _get_cdp_override() -> str:
     """
     env_override = os.environ.get("BROWSER_CDP_URL", "").strip()
     if env_override:
-        return _resolve_cdp_override(env_override)
+        return _youmake_desktop_fallback(env_override, _resolve_cdp_override(env_override))
 
     try:
         from hermes_cli.config import read_raw_config
@@ -301,11 +301,28 @@ def _get_cdp_override() -> str:
         cfg = read_raw_config()
         browser_cfg = cfg.get("browser", {})
         if isinstance(browser_cfg, dict):
-            return _resolve_cdp_override(str(browser_cfg.get("cdp_url", "") or ""))
+            raw = str(browser_cfg.get("cdp_url", "") or "")
+            return _youmake_desktop_fallback(raw, _resolve_cdp_override(raw))
     except Exception as e:
         logger.debug("Could not read browser.cdp_url from config: %s", e)
 
     return ""
+
+
+def _youmake_desktop_fallback(raw: str, resolved: str) -> str:
+    """Youmake fork: drop a dead ``hermes desktop`` override (see youmake_desktop_guard).
+
+    No-op unless ``browser.youmake_desktop`` is set in config.yaml.
+    """
+    if not resolved:
+        return resolved
+    try:
+        from tools.youmake_desktop_guard import apply_fallback
+
+        return apply_fallback(raw, resolved)
+    except Exception as e:
+        logger.debug("youmake desktop fallback check failed: %s", e)
+        return resolved
 
 
 def _get_dialog_policy_config() -> Tuple[str, float]:
@@ -2174,6 +2191,9 @@ def _run_browser_command(
         logger.warning("browser '%s' exception: %s", command, e, exc_info=True)
         result = {"success": False, "error": str(e)}
 
+    # Youmake fork: verify agent-browser attached to the desktop Chromium.
+    result = _youmake_desktop_attach_guard(task_id, session_info, command, result, cmd_prefix)
+
     # --- Lightpanda automatic Chrome fallback ---
     # If engine is lightpanda and the result looks broken, retry with Chrome.
     # This runs for ALL exit paths (timeout, empty, non-JSON, nonzero rc, parsed).
@@ -2194,6 +2214,54 @@ def _run_browser_command(
         return _annotate_lightpanda_fallback(fallback_result, fallback_reason)
 
     return result
+
+
+def _youmake_desktop_attach_guard(
+    task_id: str,
+    session_info: Dict[str, Any],
+    command: str,
+    result: Dict[str, Any],
+    cmd_prefix: List[str],
+) -> Dict[str, Any]:
+    """Youmake fork: once per CDP-override session, confirm agent-browser is
+    driving the ``hermes desktop`` Chromium and not a browser it launched.
+
+    No-op unless the session came from a CDP override AND
+    ``browser.youmake_desktop`` is set; see tools/youmake_desktop_guard.py.
+    """
+    if (
+        command == "close"
+        or not isinstance(result, dict)
+        or not result.get("success")
+        or not (session_info.get("features") or {}).get("cdp_override")
+        or session_info.get("youmake_attach_checked")
+    ):
+        return result
+    try:
+        from tools.youmake_desktop_guard import desktop_mode_enabled, verify_attach
+
+        if not desktop_mode_enabled():
+            return result
+        session_info["youmake_attach_checked"] = True
+        env = {
+            **os.environ,
+            "PATH": _merge_browser_path(os.environ.get("PATH", "")),
+            "AGENT_BROWSER_SOCKET_DIR": os.path.join(
+                _socket_safe_tmpdir(), f"agent-browser-{session_info['session_name']}"
+            ),
+        }
+        error = verify_attach(cmd_prefix, session_info["cdp_url"], env)
+    except Exception as e:
+        logger.debug("youmake desktop attach guard skipped: %s", e)
+        return result
+    if not error:
+        return result
+    logger.error("%s (task=%s)", error, task_id)
+    try:
+        cleanup_browser(task_id)  # closes the stray browser, next call re-attaches
+    except Exception as e:
+        logger.debug("cleanup after attach mismatch failed: %s", e)
+    return {"success": False, "error": error}
 
 
 def _extract_relevant_content(

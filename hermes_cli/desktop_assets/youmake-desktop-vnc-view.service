@@ -1,0 +1,17 @@
+# Rendered by `hermes desktop setup` -- edits are overwritten on the next setup.
+[Unit]
+Description=Youmake desktop: view-only VNC of ${display} on 127.0.0.1:${vnc_view_port}
+PartOf=youmake-desktop.target
+BindsTo=youmake-desktop-xvfb.service
+After=youmake-desktop-xvfb.service
+
+[Service]
+Type=simple
+User=${user}
+Group=${group}
+Environment=HOME=${home}
+ExecStartPre=${wait_display}
+# -localhost binds 127.0.0.1 only; access is gated by websockify tokens.
+ExecStart=${x11vnc_bin} -display ${display} -viewonly -shared -forever -ncache 0 -localhost -noipv6 -rfbport ${vnc_view_port} -nopw -noxdamage -quiet
+Restart=always
+RestartSec=2

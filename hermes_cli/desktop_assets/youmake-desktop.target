@@ -1,0 +1,7 @@
+# Rendered by `hermes desktop setup` -- edits are overwritten on the next setup.
+[Unit]
+Description=Youmake virtual desktop (Xvfb + Chromium + VNC + websockify)
+Wants=${target_wants}
+
+[Install]
+WantedBy=multi-user.target

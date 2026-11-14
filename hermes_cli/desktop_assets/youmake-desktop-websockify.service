@@ -1,0 +1,16 @@
+# Rendered by `hermes desktop setup` -- edits are overwritten on the next setup.
+[Unit]
+Description=Youmake desktop: websockify (noVNC) on ${ws_host}:${ws_port}
+PartOf=youmake-desktop.target
+After=youmake-desktop-vnc-view.service
+
+[Service]
+Type=simple
+User=${user}
+Group=${group}
+Environment=HOME=${home}
+# TokenFile re-reads the token file on every connection, so
+# `hermes desktop rotate-tokens` takes effect without a restart.
+ExecStart=${websockify_bin} ${web_args}--token-plugin TokenFile --token-source ${token_file} ${ws_host}:${ws_port}
+Restart=always
+RestartSec=2

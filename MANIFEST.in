@@ -5,5 +5,7 @@ graft optional-skills
 # built from the sdist (e.g. Homebrew, downstream packagers). package-data
 # below covers the wheel; this covers the sdist. See #34034 / #28149.
 recursive-include plugins plugin.yaml plugin.yml
+# Youmake fork: `hermes desktop` unit templates (wheel side is package-data).
+recursive-include hermes_cli/desktop_assets *
 global-exclude __pycache__
 global-exclude *.py[cod]

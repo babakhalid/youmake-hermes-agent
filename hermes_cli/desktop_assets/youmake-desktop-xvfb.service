@@ -1,0 +1,14 @@
+# Rendered by `hermes desktop setup` -- edits are overwritten on the next setup.
+[Unit]
+Description=Youmake desktop: Xvfb virtual display ${display}
+PartOf=youmake-desktop.target
+
+[Service]
+Type=simple
+User=${user}
+Group=${group}
+Environment=HOME=${home}
+# Unix socket only: no TCP listener for the X server.
+ExecStart=${xvfb_bin} ${display} -screen 0 ${screen} -nolisten tcp -dpi 96
+Restart=always
+RestartSec=2

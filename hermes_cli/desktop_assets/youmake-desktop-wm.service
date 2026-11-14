@@ -1,0 +1,17 @@
+# Rendered by `hermes desktop setup` -- edits are overwritten on the next setup.
+[Unit]
+Description=Youmake desktop: fluxbox window manager on ${display}
+PartOf=youmake-desktop.target
+BindsTo=youmake-desktop-xvfb.service
+After=youmake-desktop-xvfb.service
+
+[Service]
+Type=simple
+User=${user}
+Group=${group}
+Environment=HOME=${home}
+Environment=DISPLAY=${display}
+ExecStartPre=${wait_display}
+ExecStart=${fluxbox_bin}
+Restart=always
+RestartSec=2

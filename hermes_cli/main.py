@@ -11009,7 +11009,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
     {
         "acp", "auth", "backup", "bundles", "checkpoints", "claw", "completion",
         "computer-use",
-        "config", "cron", "curator", "dashboard", "debug", "doctor",
+        "config", "cron", "curator", "dashboard", "debug", "desktop", "doctor",
         "dump", "fallback", "gateway", "hooks", "import", "insights",
         "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate",
         "model", "pairing", "plugins", "portal", "postinstall", "profile", "proxy",
@@ -12995,6 +12995,25 @@ Examples:
         _register_curator_cli(curator_parser)
     except Exception as _exc:
         logging.getLogger(__name__).debug("curator CLI wiring failed: %s", _exc)
+
+    # =========================================================================
+    # desktop command (Youmake fork) -- opt-in Xvfb + Chromium + noVNC desktop
+    # =========================================================================
+    desktop_parser = subparsers.add_parser(
+        "desktop",
+        help="Virtual desktop: live view / takeover of the agent's browser over VNC",
+        description=(
+            "Run one persistent headful Chromium on an Xvfb display, expose it "
+            "through loopback-only VNC + websockify (token auth), and attach the "
+            "browser tool to it via the CDP override."
+        ),
+    )
+    try:
+        from hermes_cli.youmake_desktop import register_cli as _register_desktop_cli
+
+        _register_desktop_cli(desktop_parser)
+    except Exception as _exc:
+        logging.getLogger(__name__).debug("desktop CLI wiring failed: %s", _exc)
 
     # =========================================================================
     # memory command

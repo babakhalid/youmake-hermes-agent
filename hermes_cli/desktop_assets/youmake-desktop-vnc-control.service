@@ -1,0 +1,18 @@
+# Rendered by `hermes desktop setup` -- edits are overwritten on the next setup.
+# Interactive (takeover) VNC. Not pulled in by youmake-desktop.target:
+# only started by `hermes desktop control on`.
+[Unit]
+Description=Youmake desktop: interactive VNC of ${display} on 127.0.0.1:${vnc_control_port}
+PartOf=youmake-desktop.target
+BindsTo=youmake-desktop-xvfb.service
+After=youmake-desktop-xvfb.service
+
+[Service]
+Type=simple
+User=${user}
+Group=${group}
+Environment=HOME=${home}
+ExecStartPre=${wait_display}
+ExecStart=${x11vnc_bin} -display ${display} -shared -forever -ncache 0 -localhost -noipv6 -rfbport ${vnc_control_port} -nopw -noxdamage -quiet
+Restart=on-failure
+RestartSec=2
