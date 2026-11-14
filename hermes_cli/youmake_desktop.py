@@ -515,7 +515,11 @@ def apt_install(runner: Runner, packages: Sequence[str]) -> None:
     if not packages:
         return
     env = {**os.environ, "DEBIAN_FRONTEND": "noninteractive"}
-    apt = ["env", "DEBIAN_FRONTEND=noninteractive", "apt-get"]
+    # Wait for unattended-upgrades instead of failing on the dpkg lock.
+    apt = ["env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "-o", "DPkg::Lock::Timeout=600"]
+    # A VM can carry a half-finished dpkg run (an interrupted cloud-init or
+    # unattended upgrade); apt refuses to install anything until it is finished.
+    runner.sudo(["env", "DEBIAN_FRONTEND=noninteractive", "dpkg", "--configure", "-a"], check=False, timeout=900, env=env)
     runner.sudo([*apt, "update", "-q"], check=True, timeout=600, env=env)
     runner.sudo([*apt, "install", "-y", "-q", "--no-install-recommends", *packages], check=True, timeout=1200, env=env)
 
