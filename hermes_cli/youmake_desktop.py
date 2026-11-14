@@ -90,6 +90,7 @@ APT_PACKAGE_WM = "fluxbox"
 NOVNC_DIRS = ("/usr/share/novnc",)
 
 GOOGLE_CHROME_DEB_URL = "https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb"
+GOOGLE_CHROME_PATH = "/opt/google/chrome/chrome"
 
 # Chromium flags tuned for a 2 vCPU / 4 GB VM shared with the agent.
 BASE_CHROME_FLAGS = (
@@ -535,7 +536,7 @@ def install_google_chrome(runner: Runner) -> str:
         os.chmod(tmp, 0o755)
         os.chmod(deb, 0o644)
         apt_install(runner, [deb])
-    path = "/opt/google/chrome/chrome"
+    path = GOOGLE_CHROME_PATH
     if not os.path.isfile(path):
         raise DesktopError("google-chrome-stable installed but /opt/google/chrome/chrome is missing.")
     return path
@@ -700,7 +701,17 @@ def cmd_setup(args: argparse.Namespace, runner: Optional[Runner] = None) -> int:
         apt_install(runner, missing)
 
     explicit = [p for p in (args.chrome, os.environ.get("HERMES_DESKTOP_CHROME", "")) if p]
-    chrome = find_chrome(extra=explicit)
+    chrome = find_chrome(extra=explicit) if explicit else None
+    # The desktop browser opens arbitrary sites, so prefer Google Chrome: its
+    # .deb ships an AppArmor profile that keeps the sandbox on Ubuntu 24.04,
+    # where Chrome for Testing has to run with --no-sandbox.
+    if not chrome and os.path.isfile(GOOGLE_CHROME_PATH):
+        chrome = GOOGLE_CHROME_PATH
+    if not chrome and platform.machine() in ("x86_64", "amd64") and (args.yes or sys.stdin.isatty()):
+        log("Installing Google Chrome stable (.deb) so the browser keeps its sandbox.")
+        chrome = install_google_chrome(runner)
+    if not chrome:
+        chrome = find_chrome()
     if not chrome:
         if not args.yes and not sys.stdin.isatty():
             raise DesktopError("no Chromium found; re-run with --yes to install Google Chrome stable.")
